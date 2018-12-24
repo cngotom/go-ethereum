@@ -59,6 +59,24 @@ func (api *PrivateAdminAPI) AddPeer(url string) (bool, error) {
 	return true, nil
 }
 
+// BlockAddress block a address then will ignore transaction which comes from that address
+func (api *PrivateAdminAPI) BlockAddress(addr string) (bool, error) {
+	blockAddress(addr)
+	return true, nil
+}
+// BlockAddress block a address then will ignore transaction which comes from that address
+func (api *PrivateAdminAPI) UnBlockAddress(addr string) (bool, error) {
+	unBlockAddress(addr)
+	return true, nil
+}
+// BlockAddress block a address then will ignore transaction which comes from that address
+func (api *PrivateAdminAPI) ListBlockAddress() ([]string, error) {
+	res := listBlockAddress()
+	return res, nil
+}
+
+
+
 // RemovePeer disconnects from a remote node if the connection exists
 func (api *PrivateAdminAPI) RemovePeer(url string) (bool, error) {
 	// Make sure the server is running, fail otherwise

@@ -143,6 +143,16 @@ web3._extend({
 	property: 'admin',
 	methods: [
 		new web3._extend.Method({
+			name: 'blockAddress',
+			call: 'admin_blockAddress',
+			params: 1
+		}),
+		new web3._extend.Method({
+			name: 'unBlockAddress',
+			call: 'admin_unBlockAddress',
+			params: 1
+		}),
+		new web3._extend.Method({
 			name: 'addPeer',
 			call: 'admin_addPeer',
 			params: 1
@@ -211,6 +221,10 @@ web3._extend({
 		new web3._extend.Property({
 			name: 'datadir',
 			getter: 'admin_datadir'
+		}),
+		new web3._extend.Property({
+			name: 'blockedAddress',
+			getter: 'admin_listBlockAddress',
 		}),
 	]
 });

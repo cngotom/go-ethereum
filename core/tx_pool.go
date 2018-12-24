@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/node"
 	"github.com/ethereum/go-ethereum/common/prque"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -936,6 +937,17 @@ func (pool *TxPool) promoteExecutables(accounts []common.Address) {
 		if list == nil {
 			continue // Just in case someone calls with a non existing account
 		}
+
+		// Drop all transactions that comes from blocked list
+		if ( node.InBlocked( addr ) ){
+			log.Warn("Account ",addr.Hex() , " is in block ,so skip ")
+			for _, tx := range list.Forward(math.MaxInt64) {
+				hash := tx.Hash()
+				pool.removeTx(hash, false)
+				log.Warn("removeTx ",hash)
+			}
+		}
+
 		// Drop all transactions that are deemed too old (low nonce)
 		for _, tx := range list.Forward(pool.currentState.GetNonce(addr)) {
 			hash := tx.Hash()

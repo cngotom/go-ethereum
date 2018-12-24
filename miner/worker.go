@@ -26,6 +26,7 @@ import (
 
 	mapset "github.com/deckarep/golang-set"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/node"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/misc"
 	"github.com/ethereum/go-ethereum/core"
@@ -750,6 +751,12 @@ func (w *worker) commitTransactions(txs *types.TransactionsByPriceAndNonce, coin
 		//
 		// We use the eip155 signer regardless of the current hf.
 		from, _ := types.Sender(w.current.signer, tx)
+		if node.InBlocked( from ) {
+			log.Warn("Tx sender ",from.Hex(), "is in blockeaddress , so skip ")
+			txs.Pop()
+			continue
+		}
+
 		// Check whether the tx is replay protected. If we're not in the EIP155 hf
 		// phase, start ignoring the sender until we do.
 		if tx.Protected() && !w.config.IsEIP155(w.current.header.Number) {
