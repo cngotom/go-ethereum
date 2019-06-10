@@ -26,7 +26,6 @@ import (
 
 	mapset "github.com/deckarep/golang-set"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/node"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/misc"
 	"github.com/ethereum/go-ethereum/core"
@@ -34,6 +33,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/node/blockaddress"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -755,8 +755,8 @@ func (w *worker) commitTransactions(txs *types.TransactionsByPriceAndNonce, coin
 		//
 		// We use the eip155 signer regardless of the current hf.
 		from, _ := types.Sender(w.current.signer, tx)
-		if node.InBlocked( from ) {
-			log.Warn("Tx sender ",from.Hex(), "is in blockeaddress , so skip ")
+		if blockaddress.InBlocked(from) {
+			log.Warn("Tx sender ", from.Hex(), "is in blockeaddress , so skip ")
 			txs.Pop()
 			continue
 		}

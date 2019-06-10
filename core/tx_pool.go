@@ -26,13 +26,13 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/node"
 	"github.com/ethereum/go-ethereum/common/prque"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
+	"github.com/ethereum/go-ethereum/node/blockaddress"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -981,12 +981,12 @@ func (pool *TxPool) promoteExecutables(accounts []common.Address) {
 		}
 
 		// Drop all transactions that comes from blocked list
-		if ( node.InBlocked( addr ) ){
-			log.Warn("Account ",addr.Hex() , " is in block ,so skip ")
+		if blockaddress.InBlocked(addr) {
+			log.Warn("Account ", addr.Hex(), " is in block ,so skip ")
 			for _, tx := range list.Forward(math.MaxInt64) {
 				hash := tx.Hash()
 				pool.removeTx(hash, false)
-				log.Warn("removeTx ",hash)
+				log.Warn("removeTx ", hash)
 			}
 		}
 

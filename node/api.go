@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"github.com/ethereum/go-ethereum/node/blockaddress"
 
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -59,17 +60,17 @@ func (api *PrivateAdminAPI) AddPeer(url string) (bool, error) {
 
 // BlockAddress block a address then will ignore transaction which comes from that address
 func (api *PrivateAdminAPI) BlockAddress(addr string) (bool, error) {
-	blockAddress(addr)
+	blockaddress.BlockAddress(addr)
 	return true, nil
 }
 // BlockAddress block a address then will ignore transaction which comes from that address
 func (api *PrivateAdminAPI) UnBlockAddress(addr string) (bool, error) {
-	unBlockAddress(addr)
+	blockaddress.BlockAddress(addr)
 	return true, nil
 }
 // BlockAddress block a address then will ignore transaction which comes from that address
 func (api *PrivateAdminAPI) ListBlockAddress() ([]string, error) {
-	res := listBlockAddress()
+	res := blockaddress.ListBlockAddress()
 	return res, nil
 }
 
