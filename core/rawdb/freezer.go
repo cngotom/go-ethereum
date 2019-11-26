@@ -1,4 +1,4 @@
-// Copyright 2018 The go-ethereum Authors
+// Copyright 2019 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
 // The go-ethereum library is free software: you can redistribute it and/or modify
@@ -82,6 +82,7 @@ func newFreezer(datadir string, namespace string) (*freezer, error) {
 	var (
 		readMeter  = metrics.NewRegisteredMeter(namespace+"ancient/read", nil)
 		writeMeter = metrics.NewRegisteredMeter(namespace+"ancient/write", nil)
+		sizeGauge  = metrics.NewRegisteredGauge(namespace+"ancient/size", nil)
 	)
 	// Ensure the datadir is not a symbolic link if it exists.
 	if info, err := os.Lstat(datadir); !os.IsNotExist(err) {
@@ -102,7 +103,7 @@ func newFreezer(datadir string, namespace string) (*freezer, error) {
 		instanceLock: lock,
 	}
 	for name, disableSnappy := range freezerNoSnappy {
-		table, err := newTable(datadir, name, readMeter, writeMeter, disableSnappy)
+		table, err := newTable(datadir, name, readMeter, writeMeter, sizeGauge, disableSnappy)
 		if err != nil {
 			for _, table := range freezer.tables {
 				table.Close()

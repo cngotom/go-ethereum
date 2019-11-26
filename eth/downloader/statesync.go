@@ -347,7 +347,7 @@ func (s *stateSync) commit(force bool) error {
 	}
 	start := time.Now()
 	b := s.d.stateDB.NewBatch()
-	if written, err := s.sched.Commit(b); written == 0 || err != nil {
+	if err := s.sched.Commit(b); err != nil {
 		return err
 	}
 	if err := b.Write(); err != nil {
@@ -442,9 +442,7 @@ func (s *stateSync) process(req *stateReq) (int, error) {
 		default:
 			return successful, fmt.Errorf("invalid state node %s: %v", hash.TerminalString(), err)
 		}
-		if _, ok := req.tasks[hash]; ok {
-			delete(req.tasks, hash)
-		}
+		delete(req.tasks, hash)
 	}
 	// Put unfulfilled tasks back into the retry queue
 	npeers := s.d.peers.Len()

@@ -121,28 +121,37 @@ func runCmd(ctx *cli.Context) error {
 		ret  []byte
 		err  error
 	)
+	codeFileFlag := ctx.GlobalString(CodeFileFlag.Name)
+	codeFlag := ctx.GlobalString(CodeFlag.Name)
+
 	// The '--code' or '--codefile' flag overrides code in state
-	if ctx.GlobalString(CodeFileFlag.Name) != "" {
+	if codeFileFlag != "" || codeFlag != "" {
 		var hexcode []byte
-		var err error
-		// If - is specified, it means that code comes from stdin
-		if ctx.GlobalString(CodeFileFlag.Name) == "-" {
-			//Try reading from stdin
-			if hexcode, err = ioutil.ReadAll(os.Stdin); err != nil {
-				fmt.Printf("Could not load code from stdin: %v\n", err)
-				os.Exit(1)
+		if codeFileFlag != "" {
+			var err error
+			// If - is specified, it means that code comes from stdin
+			if codeFileFlag == "-" {
+				//Try reading from stdin
+				if hexcode, err = ioutil.ReadAll(os.Stdin); err != nil {
+					fmt.Printf("Could not load code from stdin: %v\n", err)
+					os.Exit(1)
+				}
+			} else {
+				// Codefile with hex assembly
+				if hexcode, err = ioutil.ReadFile(codeFileFlag); err != nil {
+					fmt.Printf("Could not load code from file: %v\n", err)
+					os.Exit(1)
+				}
 			}
 		} else {
-			// Codefile with hex assembly
-			if hexcode, err = ioutil.ReadFile(ctx.GlobalString(CodeFileFlag.Name)); err != nil {
-				fmt.Printf("Could not load code from file: %v\n", err)
-				os.Exit(1)
-			}
+			hexcode = []byte(codeFlag)
 		}
-		code = common.Hex2Bytes(string(bytes.TrimRight(hexcode, "\n")))
-
-	} else if ctx.GlobalString(CodeFlag.Name) != "" {
-		code = common.Hex2Bytes(ctx.GlobalString(CodeFlag.Name))
+		hexcode = bytes.TrimSpace(hexcode)
+		if len(hexcode)%2 != 0 {
+			fmt.Printf("Invalid input length for hex data (%d)\n", len(hexcode))
+			os.Exit(1)
+		}
+		code = common.FromHex(string(hexcode))
 	} else if fn := ctx.Args().First(); len(fn) > 0 {
 		// EASM-file to compile
 		src, err := ioutil.ReadFile(fn)
@@ -155,7 +164,6 @@ func runCmd(ctx *cli.Context) error {
 		}
 		code = common.Hex2Bytes(bin)
 	}
-
 	initialGas := ctx.GlobalUint64(GasFlag.Name)
 	if genesisConfig.GasLimit != 0 {
 		initialGas = genesisConfig.GasLimit
@@ -192,24 +200,36 @@ func runCmd(ctx *cli.Context) error {
 
 	if chainConfig != nil {
 		runtimeConfig.ChainConfig = chainConfig
+	} else {
+		runtimeConfig.ChainConfig = params.AllEthashProtocolChanges
 	}
 	tstart := time.Now()
 	var leftOverGas uint64
+	var hexInput []byte
+	if inputFileFlag := ctx.GlobalString(InputFileFlag.Name); inputFileFlag != "" {
+		if hexInput, err = ioutil.ReadFile(inputFileFlag); err != nil {
+			fmt.Printf("could not load input from file: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		hexInput = []byte(ctx.GlobalString(InputFlag.Name))
+	}
+	input := common.FromHex(string(bytes.TrimSpace(hexInput)))
 	if ctx.GlobalBool(CreateFlag.Name) {
-		input := append(code, common.Hex2Bytes(ctx.GlobalString(InputFlag.Name))...)
+		input = append(code, input...)
 		ret, _, leftOverGas, err = runtime.Create(input, &runtimeConfig)
 	} else {
 		if len(code) > 0 {
 			statedb.SetCode(receiver, code)
 		}
-		ret, leftOverGas, err = runtime.Call(receiver, common.Hex2Bytes(ctx.GlobalString(InputFlag.Name)), &runtimeConfig)
+		ret, leftOverGas, err = runtime.Call(receiver, input, &runtimeConfig)
 	}
 	execTime := time.Since(tstart)
 
 	if ctx.GlobalBool(DumpFlag.Name) {
 		statedb.Commit(true)
 		statedb.IntermediateRoot(true)
-		fmt.Println(string(statedb.Dump()))
+		fmt.Println(string(statedb.Dump(false, false, true)))
 	}
 
 	if memProfilePath := ctx.GlobalString(MemProfileFlag.Name); memProfilePath != "" {
