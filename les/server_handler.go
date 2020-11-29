@@ -17,6 +17,7 @@
 package les
 
 import (
+	"crypto/ecdsa"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -31,10 +32,13 @@ import (
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethdb"
+	lps "github.com/ethereum/go-ethereum/les/lespay/server"
 	"github.com/ethereum/go-ethereum/light"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/p2p"
+	"github.com/ethereum/go-ethereum/p2p/enode"
+	"github.com/ethereum/go-ethereum/p2p/nodestate"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
 )
@@ -90,7 +94,7 @@ func newServerHandler(server *LesServer, blockchain *core.BlockChain, chainDb et
 // start starts the server handler.
 func (h *serverHandler) start() {
 	h.wg.Add(1)
-	go h.broadcastHeaders()
+	go h.broadcastLoop()
 }
 
 // stop stops the server handler.
@@ -101,13 +105,14 @@ func (h *serverHandler) stop() {
 
 // runPeer is the p2p protocol run function for the given version.
 func (h *serverHandler) runPeer(version uint, p *p2p.Peer, rw p2p.MsgReadWriter) error {
-	peer := newPeer(int(version), h.server.config.NetworkId, false, p, newMeteredMsgWriter(rw, int(version)))
+	peer := newClientPeer(int(version), h.server.config.NetworkId, p, newMeteredMsgWriter(rw, int(version)))
+	defer peer.close()
 	h.wg.Add(1)
 	defer h.wg.Done()
 	return h.handle(peer)
 }
 
-func (h *serverHandler) handle(p *peer) error {
+func (h *serverHandler) handle(p *clientPeer) error {
 	p.Log().Debug("Light Ethereum peer connected", "name", p.Name())
 
 	// Execute the LES handshake
@@ -121,40 +126,66 @@ func (h *serverHandler) handle(p *peer) error {
 		p.Log().Debug("Light Ethereum handshake failed", "err", err)
 		return err
 	}
+	// Reject the duplicated peer, otherwise register it to peerset.
+	var registered bool
+	if err := h.server.ns.Operation(func() {
+		if h.server.ns.GetField(p.Node(), clientPeerField) != nil {
+			registered = true
+		} else {
+			h.server.ns.SetFieldSub(p.Node(), clientPeerField, p)
+		}
+	}); err != nil {
+		return err
+	}
+	if registered {
+		return errAlreadyRegistered
+	}
+
+	defer func() {
+		h.server.ns.SetField(p.Node(), clientPeerField, nil)
+		if p.fcClient != nil { // is nil when connecting another server
+			p.fcClient.Disconnect()
+		}
+	}()
 	if p.server {
 		// connected to another server, no messages expected, just wait for disconnection
 		_, err := p.rw.ReadMsg()
 		return err
 	}
 	// Reject light clients if server is not synced.
+	//
+	// Put this checking here, so that "non-synced" les-server peers are still allowed
+	// to keep the connection.
 	if !h.synced() {
+		p.Log().Debug("Light server not synced, rejecting peer")
 		return p2p.DiscRequested
 	}
-	defer p.fcClient.Disconnect()
-
 	// Disconnect the inbound peer if it's rejected by clientPool
-	if !h.server.clientPool.connect(p, 0) {
-		p.Log().Debug("Light Ethereum peer registration failed", "err", errFullClientPool)
+	if cap, err := h.server.clientPool.connect(p); cap != p.fcParams.MinRecharge || err != nil {
+		p.Log().Debug("Light Ethereum peer rejected", "err", errFullClientPool)
 		return errFullClientPool
 	}
-	// Register the peer locally
-	if err := h.server.peers.Register(p); err != nil {
-		h.server.clientPool.disconnect(p)
-		p.Log().Error("Light Ethereum peer registration failed", "err", err)
-		return err
+	p.balance, _ = h.server.ns.GetField(p.Node(), h.server.clientPool.BalanceField).(*lps.NodeBalance)
+	if p.balance == nil {
+		return p2p.DiscRequested
 	}
-	clientConnectionGauge.Update(int64(h.server.peers.Len()))
+	activeCount, _ := h.server.clientPool.pp.Active()
+	clientConnectionGauge.Update(int64(activeCount))
 
 	var wg sync.WaitGroup // Wait group used to track all in-flight task routines.
 
 	connectedAt := mclock.Now()
 	defer func() {
 		wg.Wait() // Ensure all background task routines have exited.
-		h.server.peers.Unregister(p.id)
 		h.server.clientPool.disconnect(p)
-		clientConnectionGauge.Update(int64(h.server.peers.Len()))
+		p.balance = nil
+		activeCount, _ := h.server.clientPool.pp.Active()
+		clientConnectionGauge.Update(int64(activeCount))
 		connectionTimer.Update(time.Duration(mclock.Now() - connectedAt))
 	}()
+	// Mark the peer starts to be served.
+	atomic.StoreUint32(&p.serving, 1)
+	defer atomic.StoreUint32(&p.serving, 0)
 
 	// Spawn a main loop to handle all incoming messages.
 	for {
@@ -173,7 +204,7 @@ func (h *serverHandler) handle(p *peer) error {
 
 // handleMsg is invoked whenever an inbound message is received from a remote
 // peer. The remote connection is torn down upon returning any error.
-func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
+func (h *serverHandler) handleMsg(p *clientPeer, wg *sync.WaitGroup) error {
 	// Read the next message from the remote peer, and ensure it's fully consumed
 	msg, err := p.rw.ReadMsg()
 	if err != nil {
@@ -207,7 +238,7 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 		maxCost = p.fcCosts.getMaxCost(msg.Code, reqCnt)
 		accepted, bufShort, priority := p.fcClient.AcceptRequest(reqID, responseCount, maxCost)
 		if !accepted {
-			p.freezeClient()
+			p.freeze()
 			p.Log().Error("Request came too early", "remaining", common.PrettyDuration(time.Duration(bufShort*1000000/p.fcParams.MinRecharge)))
 			p.fcClient.OneTimeCost(inSizeCost)
 			return false
@@ -248,13 +279,16 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 			realCost = maxCost // Assign a fake cost for testing purpose
 		} else {
 			realCost = h.server.costTracker.realCost(servingTime, msg.Size, replySize)
+			if realCost > maxCost {
+				realCost = maxCost
+			}
 		}
 		bv := p.fcClient.RequestProcessed(reqID, responseCount, maxCost, realCost)
 		if amount != 0 {
 			// Feed cost tracker request serving statistic.
 			h.server.costTracker.updateStats(msg.Code, amount, servingTime, realCost)
 			// Reduce priority "balance" for the specific peer.
-			h.server.clientPool.requestCost(p, realCost)
+			p.balance.RequestServed(realCost)
 		}
 		if reply != nil {
 			p.queueSend(func() {
@@ -273,7 +307,6 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 		if metrics.EnabledExpensive {
 			miscInHeaderPacketsMeter.Mark(1)
 			miscInHeaderTrafficMeter.Mark(int64(msg.Size))
-			defer func(start time.Time) { miscServingTimeHeaderTimer.UpdateSince(start) }(time.Now())
 		}
 		var req struct {
 			ReqID uint64
@@ -318,7 +351,6 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 						origin = h.blockchain.GetHeaderByNumber(query.Origin.Number)
 					}
 					if origin == nil {
-						atomic.AddUint32(&p.invalidCount, 1)
 						break
 					}
 					headers = append(headers, origin)
@@ -372,11 +404,12 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 					}
 					first = false
 				}
-				reply := p.ReplyBlockHeaders(req.ReqID, headers)
-				sendResponse(req.ReqID, query.Amount, p.ReplyBlockHeaders(req.ReqID, headers), task.done())
+				reply := p.replyBlockHeaders(req.ReqID, headers)
+				sendResponse(req.ReqID, query.Amount, reply, task.done())
 				if metrics.EnabledExpensive {
 					miscOutHeaderPacketsMeter.Mark(1)
 					miscOutHeaderTrafficMeter.Mark(int64(reply.size()))
+					miscServingTimeHeaderTimer.Update(time.Duration(task.servingTime))
 				}
 			}()
 		}
@@ -386,7 +419,6 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 		if metrics.EnabledExpensive {
 			miscInBodyPacketsMeter.Mark(1)
 			miscInBodyTrafficMeter.Mark(int64(msg.Size))
-			defer func(start time.Time) { miscServingTimeBodyTimer.UpdateSince(start) }(time.Now())
 		}
 		var req struct {
 			ReqID  uint64
@@ -415,17 +447,18 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 					}
 					body := h.blockchain.GetBodyRLP(hash)
 					if body == nil {
-						atomic.AddUint32(&p.invalidCount, 1)
+						p.bumpInvalid()
 						continue
 					}
 					bodies = append(bodies, body)
 					bytes += len(body)
 				}
-				reply := p.ReplyBlockBodiesRLP(req.ReqID, bodies)
+				reply := p.replyBlockBodiesRLP(req.ReqID, bodies)
 				sendResponse(req.ReqID, uint64(reqCnt), reply, task.done())
 				if metrics.EnabledExpensive {
 					miscOutBodyPacketsMeter.Mark(1)
 					miscOutBodyTrafficMeter.Mark(int64(reply.size()))
+					miscServingTimeBodyTimer.Update(time.Duration(task.servingTime))
 				}
 			}()
 		}
@@ -435,7 +468,6 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 		if metrics.EnabledExpensive {
 			miscInCodePacketsMeter.Mark(1)
 			miscInCodeTrafficMeter.Mark(int64(msg.Size))
-			defer func(start time.Time) { miscServingTimeCodeTimer.UpdateSince(start) }(time.Now())
 		}
 		var req struct {
 			ReqID uint64
@@ -463,7 +495,7 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 					header := h.blockchain.GetHeaderByHash(request.BHash)
 					if header == nil {
 						p.Log().Warn("Failed to retrieve associate header for code", "hash", request.BHash)
-						atomic.AddUint32(&p.invalidCount, 1)
+						p.bumpInvalid()
 						continue
 					}
 					// Refuse to search stale state data in the database since looking for
@@ -471,7 +503,7 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 					local := h.blockchain.CurrentHeader().Number.Uint64()
 					if !h.server.archiveMode && header.Number.Uint64()+core.TriesInMemory <= local {
 						p.Log().Debug("Reject stale code request", "number", header.Number.Uint64(), "head", local)
-						atomic.AddUint32(&p.invalidCount, 1)
+						p.bumpInvalid()
 						continue
 					}
 					triedb := h.blockchain.StateCache().TrieDB()
@@ -479,10 +511,10 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 					account, err := h.getAccount(triedb, header.Root, common.BytesToHash(request.AccKey))
 					if err != nil {
 						p.Log().Warn("Failed to retrieve account for code", "block", header.Number, "hash", header.Hash(), "account", common.BytesToHash(request.AccKey), "err", err)
-						atomic.AddUint32(&p.invalidCount, 1)
+						p.bumpInvalid()
 						continue
 					}
-					code, err := triedb.Node(common.BytesToHash(account.CodeHash))
+					code, err := h.blockchain.StateCache().ContractCode(common.BytesToHash(request.AccKey), common.BytesToHash(account.CodeHash))
 					if err != nil {
 						p.Log().Warn("Failed to retrieve account code", "block", header.Number, "hash", header.Hash(), "account", common.BytesToHash(request.AccKey), "codehash", common.BytesToHash(account.CodeHash), "err", err)
 						continue
@@ -493,11 +525,12 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 						break
 					}
 				}
-				reply := p.ReplyCode(req.ReqID, data)
+				reply := p.replyCode(req.ReqID, data)
 				sendResponse(req.ReqID, uint64(reqCnt), reply, task.done())
 				if metrics.EnabledExpensive {
 					miscOutCodePacketsMeter.Mark(1)
 					miscOutCodeTrafficMeter.Mark(int64(reply.size()))
+					miscServingTimeCodeTimer.Update(time.Duration(task.servingTime))
 				}
 			}()
 		}
@@ -507,7 +540,6 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 		if metrics.EnabledExpensive {
 			miscInReceiptPacketsMeter.Mark(1)
 			miscInReceiptTrafficMeter.Mark(int64(msg.Size))
-			defer func(start time.Time) { miscServingTimeReceiptTimer.UpdateSince(start) }(time.Now())
 		}
 		var req struct {
 			ReqID  uint64
@@ -538,7 +570,7 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 					results := h.blockchain.GetReceiptsByHash(hash)
 					if results == nil {
 						if header := h.blockchain.GetHeaderByHash(hash); header == nil || header.ReceiptHash != types.EmptyRootHash {
-							atomic.AddUint32(&p.invalidCount, 1)
+							p.bumpInvalid()
 							continue
 						}
 					}
@@ -550,11 +582,12 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 						bytes += len(encoded)
 					}
 				}
-				reply := p.ReplyReceiptsRLP(req.ReqID, receipts)
+				reply := p.replyReceiptsRLP(req.ReqID, receipts)
 				sendResponse(req.ReqID, uint64(reqCnt), reply, task.done())
 				if metrics.EnabledExpensive {
 					miscOutReceiptPacketsMeter.Mark(1)
 					miscOutReceiptTrafficMeter.Mark(int64(reply.size()))
+					miscServingTimeReceiptTimer.Update(time.Duration(task.servingTime))
 				}
 			}()
 		}
@@ -564,7 +597,6 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 		if metrics.EnabledExpensive {
 			miscInTrieProofPacketsMeter.Mark(1)
 			miscInTrieProofTrafficMeter.Mark(int64(msg.Size))
-			defer func(start time.Time) { miscServingTimeTrieProofTimer.UpdateSince(start) }(time.Now())
 		}
 		var req struct {
 			ReqID uint64
@@ -578,6 +610,7 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 		var (
 			lastBHash common.Hash
 			root      common.Hash
+			header    *types.Header
 		)
 		reqCnt := len(req.Reqs)
 		if accept(req.ReqID, uint64(reqCnt), MaxProofsFetch) {
@@ -592,16 +625,12 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 						return
 					}
 					// Look up the root hash belonging to the request
-					var (
-						header *types.Header
-						trie   state.Trie
-					)
 					if request.BHash != lastBHash {
 						root, lastBHash = common.Hash{}, request.BHash
 
 						if header = h.blockchain.GetHeaderByHash(request.BHash); header == nil {
 							p.Log().Warn("Failed to retrieve header for proof", "hash", request.BHash)
-							atomic.AddUint32(&p.invalidCount, 1)
+							p.bumpInvalid()
 							continue
 						}
 						// Refuse to search stale state data in the database since looking for
@@ -609,19 +638,20 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 						local := h.blockchain.CurrentHeader().Number.Uint64()
 						if !h.server.archiveMode && header.Number.Uint64()+core.TriesInMemory <= local {
 							p.Log().Debug("Reject stale trie request", "number", header.Number.Uint64(), "head", local)
-							atomic.AddUint32(&p.invalidCount, 1)
+							p.bumpInvalid()
 							continue
 						}
 						root = header.Root
 					}
 					// If a header lookup failed (non existent), ignore subsequent requests for the same header
 					if root == (common.Hash{}) {
-						atomic.AddUint32(&p.invalidCount, 1)
+						p.bumpInvalid()
 						continue
 					}
 					// Open the account or storage trie for the request
 					statedb := h.blockchain.StateCache()
 
+					var trie state.Trie
 					switch len(request.AccKey) {
 					case 0:
 						// No account key specified, open an account trie
@@ -635,7 +665,7 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 						account, err := h.getAccount(statedb.TrieDB(), root, common.BytesToHash(request.AccKey))
 						if err != nil {
 							p.Log().Warn("Failed to retrieve account for proof", "block", header.Number, "hash", header.Hash(), "account", common.BytesToHash(request.AccKey), "err", err)
-							atomic.AddUint32(&p.invalidCount, 1)
+							p.bumpInvalid()
 							continue
 						}
 						trie, err = statedb.OpenStorageTrie(common.BytesToHash(request.AccKey), account.Root)
@@ -653,11 +683,12 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 						break
 					}
 				}
-				reply := p.ReplyProofsV2(req.ReqID, nodes.NodeList())
+				reply := p.replyProofsV2(req.ReqID, nodes.NodeList())
 				sendResponse(req.ReqID, uint64(reqCnt), reply, task.done())
 				if metrics.EnabledExpensive {
 					miscOutTrieProofPacketsMeter.Mark(1)
 					miscOutTrieProofTrafficMeter.Mark(int64(reply.size()))
+					miscServingTimeTrieProofTimer.Update(time.Duration(task.servingTime))
 				}
 			}()
 		}
@@ -667,7 +698,6 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 		if metrics.EnabledExpensive {
 			miscInHelperTriePacketsMeter.Mark(1)
 			miscInHelperTrieTrafficMeter.Mark(int64(msg.Size))
-			defer func(start time.Time) { miscServingTimeHelperTrieTimer.UpdateSince(start) }(time.Now())
 		}
 		var req struct {
 			ReqID uint64
@@ -728,11 +758,12 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 						break
 					}
 				}
-				reply := p.ReplyHelperTrieProofs(req.ReqID, HelperTrieResps{Proofs: nodes.NodeList(), AuxData: auxData})
+				reply := p.replyHelperTrieProofs(req.ReqID, HelperTrieResps{Proofs: nodes.NodeList(), AuxData: auxData})
 				sendResponse(req.ReqID, uint64(reqCnt), reply, task.done())
 				if metrics.EnabledExpensive {
 					miscOutHelperTriePacketsMeter.Mark(1)
 					miscOutHelperTrieTrafficMeter.Mark(int64(reply.size()))
+					miscServingTimeHelperTrieTimer.Update(time.Duration(task.servingTime))
 				}
 			}()
 		}
@@ -742,7 +773,6 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 		if metrics.EnabledExpensive {
 			miscInTxsPacketsMeter.Mark(1)
 			miscInTxsTrafficMeter.Mark(int64(msg.Size))
-			defer func(start time.Time) { miscServingTimeTxTimer.UpdateSince(start) }(time.Now())
 		}
 		var req struct {
 			ReqID uint64
@@ -777,11 +807,12 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 						stats[i] = h.txStatus(hash)
 					}
 				}
-				reply := p.ReplyTxStatus(req.ReqID, stats)
+				reply := p.replyTxStatus(req.ReqID, stats)
 				sendResponse(req.ReqID, uint64(reqCnt), reply, task.done())
 				if metrics.EnabledExpensive {
 					miscOutTxsPacketsMeter.Mark(1)
 					miscOutTxsTrafficMeter.Mark(int64(reply.size()))
+					miscServingTimeTxTimer.Update(time.Duration(task.servingTime))
 				}
 			}()
 		}
@@ -791,7 +822,6 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 		if metrics.EnabledExpensive {
 			miscInTxStatusPacketsMeter.Mark(1)
 			miscInTxStatusTrafficMeter.Mark(int64(msg.Size))
-			defer func(start time.Time) { miscServingTimeTxStatusTimer.UpdateSince(start) }(time.Now())
 		}
 		var req struct {
 			ReqID  uint64
@@ -814,11 +844,12 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 					}
 					stats[i] = h.txStatus(hash)
 				}
-				reply := p.ReplyTxStatus(req.ReqID, stats)
+				reply := p.replyTxStatus(req.ReqID, stats)
 				sendResponse(req.ReqID, uint64(reqCnt), reply, task.done())
 				if metrics.EnabledExpensive {
 					miscOutTxStatusPacketsMeter.Mark(1)
 					miscOutTxStatusTrafficMeter.Mark(int64(reply.size()))
+					miscServingTimeTxStatusTimer.Update(time.Duration(task.servingTime))
 				}
 			}()
 		}
@@ -828,9 +859,9 @@ func (h *serverHandler) handleMsg(p *peer, wg *sync.WaitGroup) error {
 		clientErrorMeter.Mark(1)
 		return errResp(ErrInvalidMsgCode, "%v", msg.Code)
 	}
-	// If the client has made too much invalid request(e.g. request a non-exist data),
+	// If the client has made too much invalid request(e.g. request a non-existent data),
 	// reject them to prevent SPAM attack.
-	if atomic.LoadUint32(&p.invalidCount) > maxRequestErrors {
+	if p.getInvalid() > maxRequestErrors {
 		clientErrorMeter.Mark(1)
 		return errTooManyInvalidRequest
 	}
@@ -894,11 +925,11 @@ func (h *serverHandler) txStatus(hash common.Hash) light.TxStatus {
 	return stat
 }
 
-// broadcastHeaders broadcasts new block information to all connected light
+// broadcastLoop broadcasts new block information to all connected light
 // clients. According to the agreement between client and server, server should
 // only broadcast new announcement if the total difficulty is higher than the
 // last one. Besides server will add the signature if client requires.
-func (h *serverHandler) broadcastHeaders() {
+func (h *serverHandler) broadcastLoop() {
 	defer h.wg.Done()
 
 	headCh := make(chan core.ChainHeadEvent, 10)
@@ -912,10 +943,6 @@ func (h *serverHandler) broadcastHeaders() {
 	for {
 		select {
 		case ev := <-headCh:
-			peers := h.server.peers.AllPeers()
-			if len(peers) == 0 {
-				continue
-			}
 			header := ev.Block.Header()
 			hash, number := header.Hash(), header.Number.Uint64()
 			td := h.blockchain.GetTd(hash, number)
@@ -927,29 +954,79 @@ func (h *serverHandler) broadcastHeaders() {
 				reorg = lastHead.Number.Uint64() - rawdb.FindCommonAncestor(h.chainDb, header, lastHead).Number.Uint64()
 			}
 			lastHead, lastTd = header, td
-
 			log.Debug("Announcing block to peers", "number", number, "hash", hash, "td", td, "reorg", reorg)
-			var (
-				signed         bool
-				signedAnnounce announceData
-			)
-			announce := announceData{Hash: hash, Number: number, Td: td, ReorgDepth: reorg}
-			for _, p := range peers {
-				p := p
-				switch p.announceType {
-				case announceTypeSimple:
-					p.queueSend(func() { p.SendAnnounce(announce) })
-				case announceTypeSigned:
-					if !signed {
-						signedAnnounce = announce
-						signedAnnounce.sign(h.server.privateKey)
-						signed = true
-					}
-					p.queueSend(func() { p.SendAnnounce(signedAnnounce) })
-				}
-			}
+			h.server.broadcaster.broadcast(announceData{Hash: hash, Number: number, Td: td, ReorgDepth: reorg})
 		case <-h.closeCh:
 			return
+		}
+	}
+}
+
+// broadcaster sends new header announcements to active client peers
+type broadcaster struct {
+	ns                           *nodestate.NodeStateMachine
+	privateKey                   *ecdsa.PrivateKey
+	lastAnnounce, signedAnnounce announceData
+}
+
+// newBroadcaster creates a new broadcaster
+func newBroadcaster(ns *nodestate.NodeStateMachine) *broadcaster {
+	b := &broadcaster{ns: ns}
+	ns.SubscribeState(priorityPoolSetup.ActiveFlag, func(node *enode.Node, oldState, newState nodestate.Flags) {
+		if newState.Equals(priorityPoolSetup.ActiveFlag) {
+			// send last announcement to activated peers
+			b.sendTo(node)
+		}
+	})
+	return b
+}
+
+// setSignerKey sets the signer key for signed announcements. Should be called before
+// starting the protocol handler.
+func (b *broadcaster) setSignerKey(privateKey *ecdsa.PrivateKey) {
+	b.privateKey = privateKey
+}
+
+// broadcast sends the given announcements to all active peers
+func (b *broadcaster) broadcast(announce announceData) {
+	b.ns.Operation(func() {
+		// iterate in an Operation to ensure that the active set does not change while iterating
+		b.lastAnnounce = announce
+		b.ns.ForEach(priorityPoolSetup.ActiveFlag, nodestate.Flags{}, func(node *enode.Node, state nodestate.Flags) {
+			b.sendTo(node)
+		})
+	})
+}
+
+// sendTo sends the most recent announcement to the given node unless the same or higher Td
+// announcement has already been sent.
+func (b *broadcaster) sendTo(node *enode.Node) {
+	if b.lastAnnounce.Td == nil {
+		return
+	}
+	if p, _ := b.ns.GetField(node, clientPeerField).(*clientPeer); p != nil {
+		if p.headInfo.Td == nil || b.lastAnnounce.Td.Cmp(p.headInfo.Td) > 0 {
+			announce := b.lastAnnounce
+			switch p.announceType {
+			case announceTypeSimple:
+				if !p.queueSend(func() { p.sendAnnounce(announce) }) {
+					log.Debug("Drop announcement because queue is full", "number", announce.Number, "hash", announce.Hash)
+				} else {
+					log.Debug("Sent announcement", "number", announce.Number, "hash", announce.Hash)
+				}
+			case announceTypeSigned:
+				if b.signedAnnounce.Hash != b.lastAnnounce.Hash {
+					b.signedAnnounce = b.lastAnnounce
+					b.signedAnnounce.sign(b.privateKey)
+				}
+				announce := b.signedAnnounce
+				if !p.queueSend(func() { p.sendAnnounce(announce) }) {
+					log.Debug("Drop announcement because queue is full", "number", announce.Number, "hash", announce.Hash)
+				} else {
+					log.Debug("Sent announcement", "number", announce.Number, "hash", announce.Hash)
+				}
+			}
+			p.headInfo = blockInfo{b.lastAnnounce.Hash, b.lastAnnounce.Number, b.lastAnnounce.Td}
 		}
 	}
 }
